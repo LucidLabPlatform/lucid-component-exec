@@ -1,0 +1,563 @@
+"""
+ExecComponent — LUCID component for controlled shell-command execution.
+
+Allows Central Command (or any authorised MQTT publisher) to execute shell
+commands on an agent device and receive the results via MQTT.
+
+MQTT contract (component_id = "exec"):
+
+  Retained (QoS 1):
+    .../components/exec/metadata
+    .../components/exec/status
+    .../components/exec/state
+    .../components/exec/cfg
+    .../components/exec/cfg/logging
+    .../components/exec/cfg/telemetry
+
+  Streams (QoS 0):
+    .../components/exec/logs
+    .../components/exec/telemetry/run_count   (total completed runs since start)
+
+  Commands:
+    .../components/exec/cmd/run
+      payload: {
+        "request_id": "<uuid>",
+        "command":    "<shell command string>",
+        "timeout_s":  <float, optional, default from cfg>,
+        "cwd":        "<path, optional>",
+        "env":        {"KEY": "VALUE", ...}  (optional overlay, merged on top of agent env)
+      }
+
+    Standard commands (handled by base):
+      cmd/reset, cmd/ping,
+      cmd/cfg/set, cmd/cfg/logging/set, cmd/cfg/telemetry/set
+
+  Result events (QoS 1):
+    .../components/exec/evt/run/result
+      payload: {
+        "request_id": "<uuid>",
+        "ok":         <bool>,    # True unless allow-list rejected or OS failed to start process
+        "error":      "<str>" | null,
+        "exit_code":  <int> | null,
+        "stdout":     "<str>",
+        "stderr":     "<str>",
+        "timed_out":  <bool>
+      }
+
+    .../components/exec/evt/reset/result
+    .../components/exec/evt/ping/result
+    .../components/exec/evt/cfg/set/result
+    .../components/exec/evt/cfg/logging/set/result
+    .../components/exec/evt/cfg/telemetry/set/result
+
+Configuration (cfg topic / registry config):
+  allow_list      list[str]   Glob patterns for permitted commands.
+                              Empty list = open (all commands allowed).
+  default_timeout_s float     Default subprocess timeout in seconds.  [30.0]
+  max_timeout_s   float       Upper bound on per-request timeout.      [300.0]
+  cwd             str|null    Default working directory for subprocesses.
+
+Security model:
+  - The allow-list is the primary safety control.  Configure it in the
+    component registry before deploying to production devices.
+  - Commands rejected by the allow-list never reach subprocess.run().
+  - timeout_s from the payload is clamped to [1, max_timeout_s].
+  - Per-request env overlays are merged on top of (not replacing) the agent
+    process environment, so PATH, HOME etc. are always available.
+  - No privilege escalation is performed; the component runs as the same
+    OS user as the agent process.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+from datetime import datetime, timezone
+from typing import Any
+
+from lucid_component_base import Component, ComponentContext
+
+from . import allowlist as _allowlist
+from . import executor as _executor
+
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+_DEFAULT_TIMEOUT_S: float = 30.0
+_DEFAULT_MAX_TIMEOUT_S: float = 300.0
+
+
+class ExecComponent(Component):
+    """
+    LUCID component that executes allow-listed shell commands on the agent device
+    and publishes structured results to evt/run/result.
+
+    All runs are dispatched to a thread pool so the MQTT callback thread is never
+    blocked.  Concurrent runs are allowed up to _MAX_CONCURRENT_RUNS; excess
+    requests are rejected with a descriptive error result.
+    """
+
+    _MAX_CONCURRENT_RUNS: int = 4
+
+    def __init__(self, context: ComponentContext) -> None:
+        super().__init__(context)
+        self._log = context.logger()
+
+        cfg = context.config
+
+        # Allow-list: list of fnmatch glob patterns.  Empty = open.
+        raw_patterns = cfg.get("allow_list", [])
+        self._allow_list: list[str] = list(raw_patterns) if isinstance(raw_patterns, list) else []
+
+        self._default_timeout_s: float = float(cfg.get("default_timeout_s", _DEFAULT_TIMEOUT_S))
+        self._max_timeout_s: float = float(cfg.get("max_timeout_s", _DEFAULT_MAX_TIMEOUT_S))
+        self._default_cwd: str | None = cfg.get("cwd") or None
+
+        # Concurrency tracking
+        self._active_runs: int = 0
+        self._active_runs_lock = threading.Lock()
+
+        # Telemetry counter — total runs completed (started and finished, regardless of exit code).
+        self._run_count: int = 0
+        self._run_count_lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # LUCID component contract
+    # ------------------------------------------------------------------
+
+    @property
+    def component_id(self) -> str:
+        return "exec"
+
+    def capabilities(self) -> list[str]:
+        return ["reset", "ping", "run"]
+
+    def get_cfg_payload(self) -> dict[str, Any]:
+        return {
+            "allow_list": self._allow_list,
+            "default_timeout_s": self._default_timeout_s,
+            "max_timeout_s": self._max_timeout_s,
+            "cwd": self._default_cwd,
+        }
+
+    def get_state_payload(self) -> dict[str, Any]:
+        with self._run_count_lock:
+            run_count = self._run_count
+        with self._active_runs_lock:
+            active = self._active_runs
+        return {
+            "active_runs": active,
+            "run_count": run_count,
+            "allow_list_size": len(self._allow_list),
+            "allow_list_open": len(self._allow_list) == 0,
+            "default_timeout_s": self._default_timeout_s,
+            "max_timeout_s": self._max_timeout_s,
+        }
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def _start(self) -> None:
+        self._run_count = 0
+        self._active_runs = 0
+        self._log.info(
+            "ExecComponent started. allow_list=%r default_timeout_s=%.1f max_timeout_s=%.1f cwd=%r",
+            self._allow_list,
+            self._default_timeout_s,
+            self._max_timeout_s,
+            self._default_cwd,
+        )
+        self.set_telemetry_config({
+            "run_count": {
+                "enabled": True,
+                "interval_s": 60,
+                "change_threshold_percent": 0.0,
+            }
+        })
+        self._publish_all_retained()
+
+    def _stop(self) -> None:
+        # Active background threads are daemonised; they will finish naturally.
+        # We do not forcefully kill in-flight subprocesses on stop — they have
+        # their own timeouts and daemon threads won't block agent shutdown.
+        self._log.info("ExecComponent stopped. total_runs=%d", self._run_count)
+
+    def _publish_all_retained(self) -> None:
+        self.publish_metadata()
+        self.publish_status()
+        self.publish_state()
+        self.publish_cfg()
+
+    # ------------------------------------------------------------------
+    # Standard commands
+    # ------------------------------------------------------------------
+
+    def on_cmd_reset(self, payload_str: str) -> None:
+        try:
+            payload = json.loads(payload_str) if payload_str else {}
+            request_id = payload.get("request_id", "") if isinstance(payload, dict) else ""
+        except json.JSONDecodeError:
+            request_id = ""
+
+        self._log.info("cmd/reset request_id=%s", request_id)
+        with self._run_count_lock:
+            self._run_count = 0
+        self.publish_state()
+        self.publish_result("reset", request_id, ok=True, error=None)
+
+    def on_cmd_ping(self, payload_str: str) -> None:
+        try:
+            payload = json.loads(payload_str) if payload_str else {}
+            request_id = payload.get("request_id", "") if isinstance(payload, dict) else ""
+        except json.JSONDecodeError:
+            request_id = ""
+
+        self._log.info("cmd/ping request_id=%s", request_id)
+        self.publish_result("ping", request_id, ok=True, error=None)
+
+    def on_cmd_cfg_set(self, payload_str: str) -> None:
+        request_id, set_dict, parse_error = self._parse_cfg_set_payload(payload_str)
+        if parse_error:
+            self.publish_cfg_set_result(
+                request_id=request_id,
+                ok=False,
+                applied=None,
+                error=parse_error,
+                ts=_utc_iso(),
+                action="cfg/set",
+            )
+            return
+
+        allowed_keys = {"allow_list", "default_timeout_s", "max_timeout_s", "cwd"}
+        unknown = sorted(k for k in set_dict if k not in allowed_keys)
+        if unknown:
+            self.publish_cfg_set_result(
+                request_id=request_id,
+                ok=False,
+                applied=None,
+                error=f"unknown cfg key(s): {', '.join(unknown)}",
+                ts=_utc_iso(),
+                action="cfg/set",
+            )
+            return
+
+        applied: dict[str, Any] = {}
+
+        if "allow_list" in set_dict:
+            raw = set_dict["allow_list"]
+            if not isinstance(raw, list):
+                self.publish_cfg_set_result(
+                    request_id=request_id,
+                    ok=False,
+                    applied=None,
+                    error="allow_list must be a JSON array of strings",
+                    ts=_utc_iso(),
+                    action="cfg/set",
+                )
+                return
+            self._allow_list = [str(p) for p in raw]
+            applied["allow_list"] = self._allow_list
+
+        if "default_timeout_s" in set_dict:
+            try:
+                val = float(set_dict["default_timeout_s"])
+                if val <= 0:
+                    raise ValueError("must be positive")
+                self._default_timeout_s = val
+                applied["default_timeout_s"] = self._default_timeout_s
+            except (TypeError, ValueError) as exc:
+                self.publish_cfg_set_result(
+                    request_id=request_id,
+                    ok=False,
+                    applied=None,
+                    error=f"default_timeout_s: {exc}",
+                    ts=_utc_iso(),
+                    action="cfg/set",
+                )
+                return
+
+        if "max_timeout_s" in set_dict:
+            try:
+                val = float(set_dict["max_timeout_s"])
+                if val <= 0:
+                    raise ValueError("must be positive")
+                self._max_timeout_s = val
+                applied["max_timeout_s"] = self._max_timeout_s
+            except (TypeError, ValueError) as exc:
+                self.publish_cfg_set_result(
+                    request_id=request_id,
+                    ok=False,
+                    applied=None,
+                    error=f"max_timeout_s: {exc}",
+                    ts=_utc_iso(),
+                    action="cfg/set",
+                )
+                return
+
+        if "cwd" in set_dict:
+            cwd_val = set_dict["cwd"]
+            self._default_cwd = str(cwd_val) if cwd_val is not None else None
+            applied["cwd"] = self._default_cwd
+
+        self.publish_cfg_general()
+        self.publish_state()
+        self.publish_cfg_set_result(
+            request_id=request_id,
+            ok=True,
+            applied=applied if applied else None,
+            error=None,
+            ts=_utc_iso(),
+            action="cfg/set",
+        )
+
+    def on_cmd_cfg_logging_set(self, payload_str: str) -> None:
+        self._log.info("cmd/cfg/logging/set")
+        super().on_cmd_cfg_logging_set(payload_str)
+
+    # ------------------------------------------------------------------
+    # Run command
+    # ------------------------------------------------------------------
+
+    def on_cmd_run(self, payload_str: str) -> None:
+        """
+        Handle cmd/run — validate payload, enforce allow-list, then dispatch
+        subprocess execution to a background thread.
+
+        Expected payload:
+            {
+              "request_id": "<uuid>",
+              "command":    "<shell command string>",
+              "timeout_s":  <float, optional>,
+              "cwd":        "<path, optional>",
+              "env":        {"KEY": "VALUE", ...}  (optional)
+            }
+        """
+        try:
+            payload = json.loads(payload_str) if payload_str else {}
+        except json.JSONDecodeError:
+            self._publish_run_result(
+                request_id="",
+                ok=False,
+                error="invalid JSON in payload",
+                exit_code=None,
+                stdout="",
+                stderr="",
+                timed_out=False,
+            )
+            return
+
+        if not isinstance(payload, dict):
+            self._publish_run_result(
+                request_id="",
+                ok=False,
+                error="payload must be a JSON object",
+                exit_code=None,
+                stdout="",
+                stderr="",
+                timed_out=False,
+            )
+            return
+
+        request_id: str = payload.get("request_id", "")
+        command = payload.get("command")
+
+        if not command or not isinstance(command, str):
+            self._publish_run_result(
+                request_id=request_id,
+                ok=False,
+                error="'command' field is required and must be a non-empty string",
+                exit_code=None,
+                stdout="",
+                stderr="",
+                timed_out=False,
+            )
+            return
+
+        command = command.strip()
+        if not command:
+            self._publish_run_result(
+                request_id=request_id,
+                ok=False,
+                error="'command' must not be empty or whitespace-only",
+                exit_code=None,
+                stdout="",
+                stderr="",
+                timed_out=False,
+            )
+            return
+
+        # Allow-list gate
+        if not _allowlist.is_allowed(command, self._allow_list):
+            self._log.warning(
+                "cmd/run rejected by allow-list. request_id=%s command=%r", request_id, command
+            )
+            self._publish_run_result(
+                request_id=request_id,
+                ok=False,
+                error="command rejected by allow-list",
+                exit_code=None,
+                stdout="",
+                stderr="",
+                timed_out=False,
+            )
+            return
+
+        # Resolve per-request timeout, clamped to [1, max_timeout_s].
+        raw_timeout = payload.get("timeout_s", self._default_timeout_s)
+        try:
+            timeout_s = float(raw_timeout)
+        except (TypeError, ValueError):
+            timeout_s = self._default_timeout_s
+        timeout_s = max(1.0, min(timeout_s, self._max_timeout_s))
+
+        cwd: str | None = payload.get("cwd") or self._default_cwd
+
+        env_overlay_raw = payload.get("env")
+        env_overlay: dict[str, str] | None = None
+        if isinstance(env_overlay_raw, dict):
+            # Stringify all values for safety
+            env_overlay = {str(k): str(v) for k, v in env_overlay_raw.items()}
+
+        # Concurrency gate
+        with self._active_runs_lock:
+            if self._active_runs >= self._MAX_CONCURRENT_RUNS:
+                self._log.warning(
+                    "cmd/run rejected: concurrency limit (%d) reached. request_id=%s",
+                    self._MAX_CONCURRENT_RUNS,
+                    request_id,
+                )
+                self._publish_run_result(
+                    request_id=request_id,
+                    ok=False,
+                    error=f"concurrency limit reached ({self._MAX_CONCURRENT_RUNS} runs active)",
+                    exit_code=None,
+                    stdout="",
+                    stderr="",
+                    timed_out=False,
+                )
+                return
+            self._active_runs += 1
+
+        self._log.info(
+            "cmd/run dispatched. request_id=%s command=%r timeout_s=%.1f cwd=%r",
+            request_id,
+            command,
+            timeout_s,
+            cwd,
+        )
+        self.publish_state()
+
+        thread = threading.Thread(
+            target=self._run_in_background,
+            args=(request_id, command, timeout_s, cwd, env_overlay),
+            daemon=True,
+            name=f"exec-run-{request_id[:8] if request_id else 'anon'}",
+        )
+        thread.start()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _run_in_background(
+        self,
+        request_id: str,
+        command: str,
+        timeout_s: float,
+        cwd: str | None,
+        env_overlay: dict[str, str] | None,
+    ) -> None:
+        """Execute the command and publish the result.  Runs in a daemon thread."""
+        try:
+            result = _executor.run(
+                command,
+                shell=True,
+                timeout_s=timeout_s,
+                cwd=cwd,
+                env_overlay=env_overlay,
+            )
+        except Exception as exc:  # noqa: BLE001  # safety net — executor already catches most
+            self._log.error(
+                "Unexpected error in executor for request_id=%s: %s", request_id, exc
+            )
+            result = {
+                "exit_code": None,
+                "stdout": "",
+                "stderr": "",
+                "timed_out": False,
+                "error": f"internal error: {exc}",
+            }
+        finally:
+            with self._active_runs_lock:
+                self._active_runs = max(0, self._active_runs - 1)
+
+        with self._run_count_lock:
+            self._run_count += 1
+            run_count = self._run_count
+
+        timed_out: bool = result.get("timed_out", False)
+        exit_code: int | None = result.get("exit_code")
+        stderr: str = result.get("stderr", "")
+        stdout: str = result.get("stdout", "")
+        exec_error: str | None = result.get("error")
+
+        # ok=True even on non-zero exit codes — the command ran successfully.
+        # Callers inspect exit_code to determine success at the application level.
+        # ok=False only when the command could not be started or timed out.
+        ok: bool = exec_error is None
+
+        self._log.info(
+            "cmd/run complete. request_id=%s exit_code=%s timed_out=%s ok=%s run_count=%d",
+            request_id,
+            exit_code,
+            timed_out,
+            ok,
+            run_count,
+        )
+
+        self.publish_state()
+        self.publish_telemetry("run_count", run_count)
+
+        self._publish_run_result(
+            request_id=request_id,
+            ok=ok,
+            error=exec_error,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            timed_out=timed_out,
+        )
+
+    def _publish_run_result(
+        self,
+        *,
+        request_id: str,
+        ok: bool,
+        error: str | None,
+        exit_code: int | None,
+        stdout: str,
+        stderr: str,
+        timed_out: bool,
+    ) -> None:
+        """Publish to evt/run/result with the extended exec payload."""
+        topic = self.context.topic("evt/run/result")
+        payload = {
+            "request_id": request_id,
+            "ok": ok,
+            "error": error,
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+            "timed_out": timed_out,
+        }
+        import json as _json
+        try:
+            body = _json.dumps(payload)
+        except (TypeError, ValueError) as exc:
+            import logging
+            logging.getLogger(__name__).error("JSON encode failed for evt/run/result: %s", exc)
+            return
+        self.context.mqtt.publish(topic, body, qos=1, retain=False)

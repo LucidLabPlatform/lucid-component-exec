@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=69", "setuptools_scm[toml]>=8", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lucid-component-exec"
+dynamic = ["version"]
+description = "LUCID component for controlled shell-command execution on agent devices."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{ name = "LUCID" }]
+dependencies = [
+  "lucid-component-base @ git+https://github.com/LucidLabPlatform/lucid-component-base@v2.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov"]
+
+[project.entry-points."lucid_components"]
+exec = "lucid_component_exec.component:ExecComponent"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["lucid_component_exec*"]
+
+[tool.setuptools_scm]
+version_scheme = "no-guess-dev"
+local_scheme = "no-local-version"
+fallback_version = "0.0.0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
