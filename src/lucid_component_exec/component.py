@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import json
 import threading
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
@@ -156,6 +157,71 @@ class ExecComponent(Component):
             "max_timeout_s": self._max_timeout_s,
         }
 
+    def schema(self) -> dict[str, Any]:
+        s = deepcopy(super().schema())
+
+        # -- publishes --
+        s["publishes"]["state"]["fields"].update({
+            "active_runs": {"type": "integer"},
+            "run_count": {"type": "integer"},
+            "allow_list_size": {"type": "integer"},
+            "allow_list_open": {"type": "boolean"},
+            "default_timeout_s": {"type": "float"},
+            "max_timeout_s": {"type": "float"},
+        })
+
+        s["publishes"]["cfg"]["fields"].update({
+            "allow_list": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Glob patterns for allowed commands. Empty = open",
+            },
+            "default_timeout_s": {"type": "float", "min": 1},
+            "max_timeout_s": {"type": "float", "min": 1},
+            "cwd": {"type": "string"},
+        })
+
+        s["publishes"]["cfg/telemetry"]["fields"].update({
+            "run_count": {
+                "type": "object",
+                "fields": {
+                    "enabled": {"type": "boolean"},
+                    "interval_s": {"type": "integer", "min": 1},
+                    "change_threshold_percent": {"type": "float", "min": 0},
+                },
+            },
+        })
+
+        s["publishes"]["telemetry/run_count"] = {
+            "fields": {"value": {"type": "integer"}},
+        }
+
+        # -- subscribes --
+        s["subscribes"]["cmd/run"] = {
+            "fields": {
+                "command": {"type": "string", "description": "Shell command to execute"},
+                "timeout_s": {"type": "float", "min": 1, "max": 300},
+                "cwd": {"type": "string"},
+                "env": {"type": "object", "description": "Environment variable overrides"},
+            },
+        }
+
+        s["subscribes"]["cmd/cfg/set"] = {
+            "fields": {
+                "set": {
+                    "type": "object",
+                    "fields": {
+                        "allow_list": {"type": "array", "items": {"type": "string"}},
+                        "default_timeout_s": {"type": "float", "min": 1},
+                        "max_timeout_s": {"type": "float", "min": 1},
+                        "cwd": {"type": "string"},
+                    },
+                },
+            },
+        }
+
+        return s
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -187,6 +253,7 @@ class ExecComponent(Component):
 
     def _publish_all_retained(self) -> None:
         self.publish_metadata()
+        self.publish_schema()
         self.publish_status()
         self.publish_state()
         self.publish_cfg()
