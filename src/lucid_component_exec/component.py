@@ -71,7 +71,12 @@ Security model:
 from __future__ import annotations
 
 import json
+import os
+import re
+import signal
+import subprocess
 import threading
+import time
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
@@ -88,6 +93,9 @@ def _utc_iso() -> str:
 
 _DEFAULT_TIMEOUT_S: float = 30.0
 _DEFAULT_MAX_TIMEOUT_S: float = 300.0
+_MAX_SPAWNED_PROCESSES: int = 20
+_SPAWN_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+_DEFAULT_SIGTERM_TIMEOUT_S: float = 10.0
 
 
 class ExecComponent(Component):
@@ -124,6 +132,12 @@ class ExecComponent(Component):
         self._run_count: int = 0
         self._run_count_lock = threading.Lock()
 
+        # Managed long-running (detached) processes, keyed by user-supplied name.
+        # Each entry: {"proc": Popen, "pid": int, "command": str, "cwd": str|None,
+        #              "started_at": iso8601, "exit_code": int|None}
+        self._spawned: dict[str, dict[str, Any]] = {}
+        self._spawned_lock = threading.Lock()
+
     # ------------------------------------------------------------------
     # LUCID component contract
     # ------------------------------------------------------------------
@@ -133,7 +147,7 @@ class ExecComponent(Component):
         return "exec"
 
     def capabilities(self) -> list[str]:
-        return ["reset", "ping", "run"]
+        return ["reset", "ping", "run", "spawn", "kill", "list"]
 
     def get_cfg_payload(self) -> dict[str, Any]:
         return {
@@ -148,6 +162,17 @@ class ExecComponent(Component):
             run_count = self._run_count
         with self._active_runs_lock:
             active = self._active_runs
+        with self._spawned_lock:
+            spawned = [
+                {
+                    "name": name,
+                    "pid": entry["pid"],
+                    "started_at": entry["started_at"],
+                    "alive": entry["exit_code"] is None,
+                    "exit_code": entry["exit_code"],
+                }
+                for name, entry in self._spawned.items()
+            ]
         return {
             "active_runs": active,
             "run_count": run_count,
@@ -155,6 +180,8 @@ class ExecComponent(Component):
             "allow_list_open": len(self._allow_list) == 0,
             "default_timeout_s": self._default_timeout_s,
             "max_timeout_s": self._max_timeout_s,
+            "spawned": spawned,
+            "spawned_alive": sum(1 for s in spawned if s["alive"]),
         }
 
     def schema(self) -> dict[str, Any]:
@@ -206,6 +233,32 @@ class ExecComponent(Component):
             },
         }
 
+        s["subscribes"]["cmd/spawn"] = {
+            "fields": {
+                "name": {"type": "string", "description": "Unique handle for this process"},
+                "command": {"type": "string", "description": "Shell command to spawn (long-running)"},
+                "cwd": {"type": "string"},
+                "env": {"type": "object", "description": "Environment variable overrides"},
+            },
+        }
+
+        s["subscribes"]["cmd/kill"] = {
+            "fields": {
+                "name": {"type": "string", "description": "Name of a spawned process"},
+                "sigterm_timeout_s": {"type": "float", "min": 0, "description": "Grace period before SIGKILL"},
+            },
+        }
+
+        s["subscribes"]["cmd/list"] = {"fields": {}}
+
+        s["publishes"]["state"]["fields"].update({
+            "spawned": {
+                "type": "array",
+                "description": "Managed long-running processes",
+            },
+            "spawned_alive": {"type": "integer"},
+        })
+
         s["subscribes"]["cmd/cfg/set"] = {
             "fields": {
                 "set": {
@@ -238,18 +291,12 @@ class ExecComponent(Component):
         )
         self.set_telemetry_config({
             "run_count": {
-                "enabled": True,
-                "interval_s": 60,
+                "enabled": False,
+                "interval_s": 0.1,
                 "change_threshold_percent": 0.0,
             }
         })
         self._publish_all_retained()
-
-    def _stop(self) -> None:
-        # Active background threads are daemonised; they will finish naturally.
-        # We do not forcefully kill in-flight subprocesses on stop — they have
-        # their own timeouts and daemon threads won't block agent shutdown.
-        self._log.info("ExecComponent stopped. total_runs=%d", self._run_count)
 
     def _publish_all_retained(self) -> None:
         self.publish_metadata()
@@ -628,3 +675,278 @@ class ExecComponent(Component):
             logging.getLogger(__name__).error("JSON encode failed for evt/run/result: %s", exc)
             return
         self.context.mqtt.publish(topic, body, qos=1, retain=False)
+
+    # ------------------------------------------------------------------
+    # Spawn / kill / list — managed long-running processes
+    # ------------------------------------------------------------------
+
+    def on_cmd_spawn(self, payload_str: str) -> None:
+        """Start a detached long-running process and track it by name."""
+        try:
+            payload = json.loads(payload_str) if payload_str else {}
+        except json.JSONDecodeError:
+            self._publish_simple_result("spawn", "", False, "invalid JSON in payload")
+            return
+        if not isinstance(payload, dict):
+            self._publish_simple_result("spawn", "", False, "payload must be a JSON object")
+            return
+
+        request_id = str(payload.get("request_id", ""))
+        name = payload.get("name")
+        command = payload.get("command")
+
+        if not isinstance(name, str) or not _SPAWN_NAME_RE.fullmatch(name):
+            self._publish_simple_result(
+                "spawn", request_id, False,
+                "'name' must match ^[a-zA-Z0-9_-]+$",
+            )
+            return
+        if not isinstance(command, str) or not command.strip():
+            self._publish_simple_result("spawn", request_id, False, "'command' is required")
+            return
+        command = command.strip()
+
+        if not _allowlist.is_allowed(command, self._allow_list):
+            self._log.warning("cmd/spawn rejected by allow-list: name=%s", name)
+            self._publish_simple_result(
+                "spawn", request_id, False, "command rejected by allow-list",
+            )
+            return
+
+        cwd = payload.get("cwd") or self._default_cwd
+        env_overlay_raw = payload.get("env")
+        env: dict[str, str] | None = None
+        if isinstance(env_overlay_raw, dict):
+            env = {**os.environ, **{str(k): str(v) for k, v in env_overlay_raw.items()}}
+
+        with self._spawned_lock:
+            existing = self._spawned.get(name)
+            if existing is not None and existing["exit_code"] is None:
+                self._publish_simple_result(
+                    "spawn", request_id, False,
+                    f"name '{name}' already spawned (pid {existing['pid']})",
+                    extra={"name": name, "pid": existing["pid"]},
+                )
+                return
+            if len(self._spawned) >= _MAX_SPAWNED_PROCESSES:
+                self._publish_simple_result(
+                    "spawn", request_id, False,
+                    f"max spawned limit reached ({_MAX_SPAWNED_PROCESSES})",
+                )
+                return
+
+            try:
+                proc = subprocess.Popen(
+                    ["bash", "-c", command],
+                    cwd=cwd,
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,  # new process group — survives parent death
+                )
+            except OSError as exc:
+                self._publish_simple_result(
+                    "spawn", request_id, False, f"failed to spawn: {exc}",
+                )
+                return
+
+            entry: dict[str, Any] = {
+                "proc": proc,
+                "pid": proc.pid,
+                "command": command,
+                "cwd": cwd,
+                "started_at": _utc_iso(),
+                "exit_code": None,
+            }
+            self._spawned[name] = entry
+
+        self._log.info("cmd/spawn ok: name=%s pid=%d command=%r", name, proc.pid, command)
+
+        # Start monitor thread to detect exit
+        monitor = threading.Thread(
+            target=self._monitor_spawned,
+            args=(name,),
+            daemon=True,
+            name=f"exec-monitor-{name}",
+        )
+        monitor.start()
+
+        self.publish_state()
+        self._publish_simple_result(
+            "spawn", request_id, True, None,
+            extra={"name": name, "pid": proc.pid},
+        )
+
+    def on_cmd_kill(self, payload_str: str) -> None:
+        """Kill a previously spawned process by name (SIGTERM → SIGKILL)."""
+        try:
+            payload = json.loads(payload_str) if payload_str else {}
+        except json.JSONDecodeError:
+            self._publish_simple_result("kill", "", False, "invalid JSON in payload")
+            return
+        if not isinstance(payload, dict):
+            self._publish_simple_result("kill", "", False, "payload must be a JSON object")
+            return
+
+        request_id = str(payload.get("request_id", ""))
+        name = payload.get("name")
+        sigterm_timeout_s = payload.get("sigterm_timeout_s", _DEFAULT_SIGTERM_TIMEOUT_S)
+        try:
+            sigterm_timeout_s = max(0.0, float(sigterm_timeout_s))
+        except (TypeError, ValueError):
+            sigterm_timeout_s = _DEFAULT_SIGTERM_TIMEOUT_S
+
+        if not isinstance(name, str) or not _SPAWN_NAME_RE.fullmatch(name):
+            self._publish_simple_result(
+                "kill", request_id, False,
+                "'name' must match ^[a-zA-Z0-9_-]+$",
+            )
+            return
+
+        with self._spawned_lock:
+            entry = self._spawned.get(name)
+            if entry is None:
+                self._publish_simple_result(
+                    "kill", request_id, False, f"unknown name '{name}'",
+                )
+                return
+            proc: subprocess.Popen = entry["proc"]
+            pid = entry["pid"]
+            if entry["exit_code"] is not None:
+                self._publish_simple_result(
+                    "kill", request_id, True, None,
+                    extra={"name": name, "exit_code": entry["exit_code"], "already_dead": True},
+                )
+                return
+
+        # Send SIGTERM to the process group (start_new_session=True made pid the pgid)
+        exit_code: int | None = None
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except ProcessLookupError:
+            # Already gone
+            pass
+        except OSError as exc:
+            self._publish_simple_result(
+                "kill", request_id, False, f"failed SIGTERM: {exc}",
+                extra={"name": name, "pid": pid},
+            )
+            return
+
+        # Wait up to sigterm_timeout_s for graceful exit
+        try:
+            exit_code = proc.wait(timeout=sigterm_timeout_s)
+        except subprocess.TimeoutExpired:
+            self._log.warning("name=%s did not exit after SIGTERM, sending SIGKILL", name)
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            try:
+                exit_code = proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                self._log.error("name=%s did not exit even after SIGKILL", name)
+
+        with self._spawned_lock:
+            entry = self._spawned.get(name)
+            if entry is not None:
+                entry["exit_code"] = exit_code if exit_code is not None else -9
+
+        self._log.info("cmd/kill ok: name=%s pid=%d exit_code=%s", name, pid, exit_code)
+        self.publish_state()
+        self._publish_simple_result(
+            "kill", request_id, True, None,
+            extra={"name": name, "pid": pid, "exit_code": exit_code},
+        )
+
+    def on_cmd_list(self, payload_str: str) -> None:
+        """List all managed spawned processes."""
+        try:
+            payload = json.loads(payload_str) if payload_str else {}
+            request_id = str(payload.get("request_id", "")) if isinstance(payload, dict) else ""
+        except json.JSONDecodeError:
+            request_id = ""
+
+        with self._spawned_lock:
+            spawned = [
+                {
+                    "name": name,
+                    "pid": entry["pid"],
+                    "command": entry["command"],
+                    "started_at": entry["started_at"],
+                    "alive": entry["exit_code"] is None,
+                    "exit_code": entry["exit_code"],
+                }
+                for name, entry in self._spawned.items()
+            ]
+
+        self._publish_simple_result(
+            "list", request_id, True, None, extra={"spawned": spawned},
+        )
+
+    def _monitor_spawned(self, name: str) -> None:
+        """Background: wait for a spawned process to exit, then update state."""
+        with self._spawned_lock:
+            entry = self._spawned.get(name)
+            if entry is None:
+                return
+            proc = entry["proc"]
+
+        try:
+            rc = proc.wait()
+        except Exception as exc:  # noqa: BLE001
+            self._log.exception("monitor for name=%s failed: %s", name, exc)
+            rc = -1
+
+        with self._spawned_lock:
+            entry = self._spawned.get(name)
+            if entry is not None and entry["exit_code"] is None:
+                entry["exit_code"] = rc
+                self._log.info("spawned process exited: name=%s exit_code=%s", name, rc)
+
+        try:
+            self.publish_state()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _publish_simple_result(
+        self,
+        action: str,
+        request_id: str,
+        ok: bool,
+        error: str | None,
+        *,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Publish to evt/{action}/result with a minimal payload."""
+        topic = self.context.topic(f"evt/{action}/result")
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "ok": ok,
+            "error": error,
+        }
+        if extra:
+            payload.update(extra)
+        try:
+            body = json.dumps(payload)
+        except (TypeError, ValueError) as exc:
+            self._log.error("JSON encode failed for evt/%s/result: %s", action, exc)
+            return
+        self.context.mqtt.publish(topic, body, qos=1, retain=False)
+
+    def _stop(self) -> None:
+        """Override to also terminate spawned processes on component stop."""
+        with self._spawned_lock:
+            alive = [
+                (name, entry) for name, entry in self._spawned.items()
+                if entry["exit_code"] is None
+            ]
+        for name, entry in alive:
+            pid = entry["pid"]
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+                self._log.info("stopped spawned process: name=%s pid=%d", name, pid)
+            except (ProcessLookupError, OSError):
+                pass
+        self._log.info("ExecComponent stopped. total_runs=%d", self._run_count)
