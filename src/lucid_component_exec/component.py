@@ -936,17 +936,44 @@ class ExecComponent(Component):
         self.context.mqtt.publish(topic, body, qos=1, retain=False)
 
     def _stop(self) -> None:
-        """Override to also terminate spawned processes on component stop."""
+        """Kill all tracked spawned processes before stopping the component."""
         with self._spawned_lock:
             alive = [
                 (name, entry) for name, entry in self._spawned.items()
                 if entry["exit_code"] is None
             ]
+
         for name, entry in alive:
             pid = entry["pid"]
+            proc: subprocess.Popen = entry["proc"]
+
+            # SIGTERM first
             try:
                 os.killpg(os.getpgid(pid), signal.SIGTERM)
-                self._log.info("stopped spawned process: name=%s pid=%d", name, pid)
+                self._log.info("_stop: SIGTERM sent to name=%s pid=%d", name, pid)
             except (ProcessLookupError, OSError):
-                pass
-        self._log.info("ExecComponent stopped. total_runs=%d", self._run_count)
+                self._log.info("_stop: name=%s pid=%d already gone", name, pid)
+                continue
+
+            # Wait for graceful exit
+            try:
+                exit_code = proc.wait(timeout=_DEFAULT_SIGTERM_TIMEOUT_S)
+                self._log.info("_stop: name=%s pid=%d exited cleanly exit_code=%s", name, pid, exit_code)
+            except subprocess.TimeoutExpired:
+                # SIGKILL fallback
+                self._log.warning("_stop: name=%s pid=%d did not exit after SIGTERM, sending SIGKILL", name, pid)
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+                try:
+                    exit_code = proc.wait(timeout=5.0)
+                    self._log.info("_stop: name=%s pid=%d killed exit_code=%s", name, pid, exit_code)
+                except subprocess.TimeoutExpired:
+                    self._log.error("_stop: name=%s pid=%d did not die after SIGKILL", name, pid)
+
+            with self._spawned_lock:
+                if name in self._spawned:
+                    self._spawned[name]["exit_code"] = proc.returncode
+
+        self._log.info("ExecComponent stopped. total_runs=%d alive_killed=%d", self._run_count, len(alive))
