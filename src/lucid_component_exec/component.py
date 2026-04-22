@@ -134,7 +134,7 @@ class ExecComponent(Component):
 
         # Managed long-running (detached) processes, keyed by user-supplied name.
         # Each entry: {"proc": Popen, "pid": int, "command": str, "cwd": str|None,
-        #              "started_at": iso8601, "exit_code": int|None}
+        #              "started_at": iso8601, "exit_code": int|None, "killing": bool}
         self._spawned: dict[str, dict[str, Any]] = {}
         self._spawned_lock = threading.Lock()
 
@@ -195,6 +195,11 @@ class ExecComponent(Component):
             "allow_list_open": {"type": "boolean"},
             "default_timeout_s": {"type": "float"},
             "max_timeout_s": {"type": "float"},
+            "spawned": {
+                "type": "array",
+                "description": "Managed long-running processes",
+            },
+            "spawned_alive": {"type": "integer"},
         })
 
         s["publishes"]["cfg"]["fields"].update({
@@ -251,14 +256,6 @@ class ExecComponent(Component):
 
         s["subscribes"]["cmd/list"] = {"fields": {}}
 
-        s["publishes"]["state"]["fields"].update({
-            "spawned": {
-                "type": "array",
-                "description": "Managed long-running processes",
-            },
-            "spawned_alive": {"type": "integer"},
-        })
-
         s["subscribes"]["cmd/cfg/set"] = {
             "fields": {
                 "set": {
@@ -282,6 +279,7 @@ class ExecComponent(Component):
     def _start(self) -> None:
         self._run_count = 0
         self._active_runs = 0
+        self._spawned = {}
         self._log.info(
             "ExecComponent started. allow_list=%r default_timeout_s=%.1f max_timeout_s=%.1f cwd=%r",
             self._allow_list,
@@ -667,12 +665,10 @@ class ExecComponent(Component):
             "stderr": stderr,
             "timed_out": timed_out,
         }
-        import json as _json
         try:
-            body = _json.dumps(payload)
+            body = json.dumps(payload)
         except (TypeError, ValueError) as exc:
-            import logging
-            logging.getLogger(__name__).error("JSON encode failed for evt/run/result: %s", exc)
+            self._log.error("JSON encode failed for evt/run/result: %s", exc)
             return
         self.context.mqtt.publish(topic, body, qos=1, retain=False)
 
@@ -728,7 +724,11 @@ class ExecComponent(Component):
                     extra={"name": name, "pid": existing["pid"]},
                 )
                 return
-            if len(self._spawned) >= _MAX_SPAWNED_PROCESSES:
+            # Count only alive processes toward the limit
+            alive_count = sum(
+                1 for e in self._spawned.values() if e["exit_code"] is None
+            )
+            if alive_count >= _MAX_SPAWNED_PROCESSES:
                 self._publish_simple_result(
                     "spawn", request_id, False,
                     f"max spawned limit reached ({_MAX_SPAWNED_PROCESSES})",
@@ -743,7 +743,7 @@ class ExecComponent(Component):
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     stdin=subprocess.DEVNULL,
-                    start_new_session=True,  # new process group — survives parent death
+                    start_new_session=True,  # pid == pgid; new process group survives parent death
                 )
             except OSError as exc:
                 self._publish_simple_result(
@@ -758,6 +758,7 @@ class ExecComponent(Component):
                 "cwd": cwd,
                 "started_at": _utc_iso(),
                 "exit_code": None,
+                "killing": False,
             }
             self._spawned[name] = entry
 
@@ -779,7 +780,7 @@ class ExecComponent(Component):
         )
 
     def on_cmd_kill(self, payload_str: str) -> None:
-        """Kill a previously spawned process by name (SIGTERM → SIGKILL)."""
+        """Kill a previously spawned process by name (SIGTERM → SIGKILL). Non-blocking."""
         try:
             payload = json.loads(payload_str) if payload_str else {}
         except json.JSONDecodeError:
@@ -811,36 +812,64 @@ class ExecComponent(Component):
                     "kill", request_id, False, f"unknown name '{name}'",
                 )
                 return
-            proc: subprocess.Popen = entry["proc"]
-            pid = entry["pid"]
             if entry["exit_code"] is not None:
                 self._publish_simple_result(
                     "kill", request_id, True, None,
                     extra={"name": name, "exit_code": entry["exit_code"], "already_dead": True},
                 )
                 return
+            if entry.get("killing"):
+                self._publish_simple_result(
+                    "kill", request_id, False,
+                    f"kill already in progress for '{name}'",
+                )
+                return
+            entry["killing"] = True
+            proc: subprocess.Popen = entry["proc"]
+            pid = entry["pid"]
 
-        # Send SIGTERM to the process group (start_new_session=True made pid the pgid)
+        # Dispatch the blocking wait to a background thread so the MQTT callback
+        # thread is never held.
+        thread = threading.Thread(
+            target=self._kill_process_bg,
+            args=(name, pid, proc, sigterm_timeout_s, request_id),
+            daemon=True,
+            name=f"exec-kill-{name}",
+        )
+        thread.start()
+
+    def _kill_process_bg(
+        self,
+        name: str,
+        pid: int,
+        proc: subprocess.Popen,
+        sigterm_timeout_s: float,
+        request_id: str,
+    ) -> None:
+        """Background thread: SIGTERM → wait → SIGKILL a spawned process."""
+        # Since start_new_session=True, pid == pgid — no need for os.getpgid().
         exit_code: int | None = None
         try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
+            os.killpg(pid, signal.SIGTERM)
         except ProcessLookupError:
-            # Already gone
-            pass
+            pass  # already gone
         except OSError as exc:
+            with self._spawned_lock:
+                entry = self._spawned.get(name)
+                if entry is not None:
+                    entry["killing"] = False
             self._publish_simple_result(
                 "kill", request_id, False, f"failed SIGTERM: {exc}",
                 extra={"name": name, "pid": pid},
             )
             return
 
-        # Wait up to sigterm_timeout_s for graceful exit
         try:
             exit_code = proc.wait(timeout=sigterm_timeout_s)
         except subprocess.TimeoutExpired:
             self._log.warning("name=%s did not exit after SIGTERM, sending SIGKILL", name)
             try:
-                os.killpg(os.getpgid(pid), signal.SIGKILL)
+                os.killpg(pid, signal.SIGKILL)
             except (ProcessLookupError, OSError):
                 pass
             try:
@@ -852,6 +881,7 @@ class ExecComponent(Component):
             entry = self._spawned.get(name)
             if entry is not None:
                 entry["exit_code"] = exit_code if exit_code is not None else -9
+                entry["killing"] = False
 
         self._log.info("cmd/kill ok: name=%s pid=%d exit_code=%s", name, pid, exit_code)
         self.publish_state()
@@ -943,27 +973,24 @@ class ExecComponent(Component):
                 if entry["exit_code"] is None
             ]
 
-        for name, entry in alive:
+        def _kill_one(name: str, entry: dict) -> None:
             pid = entry["pid"]
             proc: subprocess.Popen = entry["proc"]
-
-            # SIGTERM first
+            # Since start_new_session=True, pid == pgid.
             try:
-                os.killpg(os.getpgid(pid), signal.SIGTERM)
+                os.killpg(pid, signal.SIGTERM)
                 self._log.info("_stop: SIGTERM sent to name=%s pid=%d", name, pid)
             except (ProcessLookupError, OSError):
                 self._log.info("_stop: name=%s pid=%d already gone", name, pid)
-                continue
+                return
 
-            # Wait for graceful exit
             try:
                 exit_code = proc.wait(timeout=_DEFAULT_SIGTERM_TIMEOUT_S)
                 self._log.info("_stop: name=%s pid=%d exited cleanly exit_code=%s", name, pid, exit_code)
             except subprocess.TimeoutExpired:
-                # SIGKILL fallback
                 self._log.warning("_stop: name=%s pid=%d did not exit after SIGTERM, sending SIGKILL", name, pid)
                 try:
-                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                    os.killpg(pid, signal.SIGKILL)
                 except (ProcessLookupError, OSError):
                     pass
                 try:
@@ -971,9 +998,22 @@ class ExecComponent(Component):
                     self._log.info("_stop: name=%s pid=%d killed exit_code=%s", name, pid, exit_code)
                 except subprocess.TimeoutExpired:
                     self._log.error("_stop: name=%s pid=%d did not die after SIGKILL", name, pid)
+                    exit_code = None
 
             with self._spawned_lock:
                 if name in self._spawned:
-                    self._spawned[name]["exit_code"] = proc.returncode
+                    self._spawned[name]["exit_code"] = (
+                        exit_code if exit_code is not None else -9
+                    )
+
+        if alive:
+            threads = [
+                threading.Thread(target=_kill_one, args=(name, entry), daemon=True)
+                for name, entry in alive
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=_DEFAULT_SIGTERM_TIMEOUT_S + 6.0)
 
         self._log.info("ExecComponent stopped. total_runs=%d alive_killed=%d", self._run_count, len(alive))
